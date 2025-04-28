@@ -18,6 +18,17 @@ type ApiServer struct {
 
 type ApiServerList struct {
 	Servers []ApiServer
+	Latest  int
+}
+
+func (server *ApiServer) healthCheck() bool {
+	// Add dial (active) health check with time outs
+	// Add somewhere logic to temporaly remove servers after consecutive failures
+	return true
+}
+
+func (slist *ApiServerList) nextServer() int {
+	return (slist.Latest + 1) % len(slist.Servers)
 }
 
 func main() {
