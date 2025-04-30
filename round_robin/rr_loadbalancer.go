@@ -24,6 +24,7 @@ type ApiServerList struct {
 	Servers []*ApiServer
 	current atomic.Uint32
 	config  Config
+	mu      sync.RWMutex
 }
 
 type Config struct {
@@ -48,12 +49,23 @@ func (server *ApiServer) healthCheck(timeout time.Duration) bool {
 }
 
 func (slist *ApiServerList) nextServer() *ApiServer {
-	for i := 0; i < len(slist.Servers); i++ {
+	// define the number of current Servers
+	// Using RWMutex for the possible data race
+	slist.mu.RLock()
+	numOfServers := len(slist.Servers)
+	if numOfServers == 0 {
+		return nil
+	}
+	defer slist.mu.RUnlock()
+
+	for i := 0; i < numOfServers; i++ {
 		idx := slist.current.Add(1) % uint32(len(slist.Servers))
 		server := slist.Servers[idx]
+
 		server.mu.RLock()
 		alive := server.alive
 		server.mu.RUnlock()
+
 		if alive {
 			return server
 		}
