@@ -4,31 +4,65 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type ApiServer struct {
-	router string
-	alive  bool
+	addr  string
+	alive bool
+	mu    sync.RWMutex
 }
 
 type ApiServerList struct {
-	Servers []ApiServer
-	Latest  int
+	Servers []*ApiServer
+	current atomic.Uint32
+	config  Config
 }
 
-func (server *ApiServer) healthCheck() bool {
-	// Add dial (active) health check with time outs
-	// Add somewhere logic to temporaly remove servers after consecutive failures
+type Config struct {
+	Port         string        `yaml:"port"`
+	Backends     []string      `yaml:"backends"`
+	health_check time.Duration `yaml:"health_check_interval"`
+}
+
+func (server *ApiServer) healthCheck(timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", server.addr, timeout)
+	if err != nil {
+		server.mu.Lock()
+		server.alive = false
+		server.mu.Unlock()
+		return false
+	}
+	conn.Close()
+	server.mu.Lock()
+	server.alive = true
+	server.mu.Unlock()
 	return true
 }
 
-func (slist *ApiServerList) nextServer() int {
-	return (slist.Latest + 1) % len(slist.Servers)
+func (slist *ApiServerList) nextServer() *ApiServer {
+	for i := 0; i < len(slist.Servers); i++ {
+		idx := slist.current.Add(1) % uint32(len(slist.Servers))
+		server := slist.Servers[idx]
+		server.mu.RLock()
+		alive := server.alive
+		server.mu.RUnlock()
+		if alive {
+			return server
+		}
+	}
+	return nil
+}
+
+func loadBalancing() {
+	// add standard rr load balancer logic
 }
 
 func main() {
