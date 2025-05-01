@@ -33,6 +33,20 @@ type Config struct {
 	health_check time.Duration `yaml:"health_check_interval"`
 }
 
+func NewApiServerList(cfg Config) *ApiServerList {
+	servers := make([]*ApiServer, len(cfg.Backends))
+	for i, addr := range cfg.Backends {
+		servers[i] = &ApiServer{
+			addr:  addr,
+			alive: true,
+		}
+	}
+	return &ApiServerList{
+		Servers: servers,
+		config:  cfg,
+	}
+}
+
 func (server *ApiServer) healthCheck(timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", server.addr, timeout)
 	if err != nil {
@@ -48,13 +62,13 @@ func (server *ApiServer) healthCheck(timeout time.Duration) bool {
 	return true
 }
 
-func (slist *ApiServerList) nextServer() *ApiServer {
+func (slist *ApiServerList) nextServer() (*ApiServer, error) {
 	// define the number of current Servers
 	// Using RWMutex for the possible data race
 	slist.mu.RLock()
 	numOfServers := len(slist.Servers)
 	if numOfServers == 0 {
-		return nil
+		return nil, errors.New("error: there are no available servers")
 	}
 	defer slist.mu.RUnlock()
 
@@ -67,10 +81,10 @@ func (slist *ApiServerList) nextServer() *ApiServer {
 		server.mu.RUnlock()
 
 		if alive {
-			return server
+			return server, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func loadBalancing() {
