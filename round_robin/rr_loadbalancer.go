@@ -1,4 +1,4 @@
-package roundrobin
+package main
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -87,8 +89,20 @@ func (slist *ApiServerList) nextServer() (*ApiServer, error) {
 	return nil, nil
 }
 
-func loadBalancing() {
-	// add standard rr load balancer logic
+func (slist *ApiServerList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	server, err := slist.nextServer()
+	if err != nil {
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
+		Scheme: "http",
+		Host:   server.addr,
+	})
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("Proxy error ocured: %v", err)
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+	}
 }
 
 func main() {
