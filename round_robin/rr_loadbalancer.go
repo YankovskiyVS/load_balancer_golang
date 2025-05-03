@@ -16,118 +16,161 @@ import (
 	"time"
 )
 
-type ApiServer struct {
+type BackendServer struct {
 	addr  string
 	alive bool
 	mu    sync.RWMutex
 }
 
-type ApiServerList struct {
-	Servers []*ApiServer
-	current atomic.Uint32
-	config  Config
-	mu      sync.RWMutex
+func (b *BackendServer) IsAlive() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.alive
+}
+
+type LoadBalancer struct {
+	Servers  []*BackendServer
+	current  atomic.Uint32
+	config   Config
+	stopChan chan struct{}
 }
 
 type Config struct {
-	Port         string        `yaml:"port"`
-	Backends     []string      `yaml:"backends"`
-	health_check time.Duration `yaml:"health_check_interval"`
+	BindAddress         string        `yaml:"bind_address"`
+	Backends            []string      `yaml:"backends"`
+	HealthCheckInterval time.Duration `yaml:"health_check_interval"`
+	DialTimeout         time.Duration `yaml:"dial_timeout"`
 }
 
-func NewApiServerList(cfg Config) *ApiServerList {
-	servers := make([]*ApiServer, len(cfg.Backends))
+func NewLoadBalancer(cfg Config) *LoadBalancer {
+	servers := make([]*BackendServer, len(cfg.Backends))
 	for i, addr := range cfg.Backends {
-		servers[i] = &ApiServer{
+		servers[i] = &BackendServer{
 			addr:  addr,
 			alive: true,
 		}
 	}
-	return &ApiServerList{
-		Servers: servers,
-		config:  cfg,
+	return &LoadBalancer{
+		Servers:  servers,
+		config:   cfg,
+		stopChan: make(chan struct{}),
 	}
 }
 
-func (server *ApiServer) healthCheck(timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", server.addr, timeout)
+func (b *BackendServer) healthCheck(timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", b.addr, timeout)
 	if err != nil {
-		server.mu.Lock()
-		server.alive = false
-		server.mu.Unlock()
+		b.mu.Lock()
+		b.alive = false
+		b.mu.Unlock()
 		return false
 	}
 	conn.Close()
-	server.mu.Lock()
-	server.alive = true
-	server.mu.Unlock()
+	b.mu.Lock()
+	b.alive = true
+	b.mu.Unlock()
 	return true
 }
 
-func (slist *ApiServerList) nextServer() (*ApiServer, error) {
-	// define the number of current Servers
-	// Using RWMutex for the possible data race
-	slist.mu.RLock()
-	numOfServers := len(slist.Servers)
-	if numOfServers == 0 {
-		return nil, errors.New("error: there are no available servers")
-	}
-	defer slist.mu.RUnlock()
-
-	for i := 0; i < numOfServers; i++ {
-		idx := slist.current.Add(1) % uint32(len(slist.Servers))
-		server := slist.Servers[idx]
-
-		server.mu.RLock()
-		alive := server.alive
-		server.mu.RUnlock()
-
-		if alive {
-			return server, nil
+func (lb *LoadBalancer) StartHealthCheck() {
+	ticker := time.NewTicker(lb.config.HealthCheckInterval)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				lb.runHealthChecks()
+			case <-lb.stopChan:
+				ticker.Stop()
+				return
+			}
 		}
-	}
-	return nil, nil
+	}()
 }
 
-func (slist *ApiServerList) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	server, err := slist.nextServer()
+func (lb *LoadBalancer) runHealthChecks() {
+	var wg sync.WaitGroup
+	for _, backend := range lb.Servers {
+		wg.Add(1)
+		go func(b *BackendServer) {
+			defer wg.Done()
+			b.healthCheck(lb.config.DialTimeout)
+		}(backend)
+	}
+	wg.Wait()
+}
+
+func (lb *LoadBalancer) nextServer() (*BackendServer, error) {
+	num := uint32(len(lb.Servers))
+	if num == 0 {
+		return nil, errors.New("no configured servers")
+	}
+
+	start := lb.current.Load()
+	for i := uint32(0); i < num; i++ {
+		idx := (start + i) % num
+		if lb.Servers[idx].IsAlive() {
+			lb.current.Store(idx + 1)
+			return lb.Servers[idx], nil
+		}
+	}
+	return nil, errors.New("no healthy servers available")
+}
+
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	server, err := lb.nextServer()
 	if err != nil {
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}
+
 	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
 		Scheme: "http",
 		Host:   server.addr,
 	})
+
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("Proxy error ocured: %v", err)
+		log.Printf("Proxy error occurred: %v", err)
+		server.mu.Lock()
+		server.alive = false
+		server.mu.Unlock()
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 	}
+
+	proxy.ServeHTTP(w, r)
 }
 
 func main() {
-	loadBalancer := &http.Server{
-		Addr: ":8080",
+	cfg := Config{
+		BindAddress:         ":8080",
+		Backends:            []string{"127.0.0.1:8081", "127.0.0.2:8081", "127.0.0.3:8081"},
+		HealthCheckInterval: 5 * time.Second,
+		DialTimeout:         2 * time.Second,
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {})
+	lb := NewLoadBalancer(cfg)
+	lb.StartHealthCheck()
+	defer close(lb.stopChan)
+
+	server := &http.Server{
+		Addr:    cfg.BindAddress,
+		Handler: lb,
+	}
 
 	go func() {
-		if err := loadBalancer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("Load balancer error: %v", err)
 		}
-		log.Println("Load balancer is stopped")
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownRelease()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	if err := loadBalancer.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Load balancer shutdown error: %v", err)
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
 	}
 	log.Println("Graceful shutdown complete")
 }
